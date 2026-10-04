@@ -51,12 +51,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 // UnmarshalCaddyfile parses the file_server directive. It enables
 // the static file server and configures it with this syntax:
 //
-//	file_server [<matcher>] [browse] {
+//	file_server [<matcher>] [browse|snapshot] {
 //	    fs            <filesystem>
 //	    root          <path>
 //	    hide          <files...>
 //	    index         <files...>
 //	    browse        [<template_file>]
+//	    snapshot      [metadata|sha256]
 //	    precompressed <formats...>
 //	    status        <status>
 //	    disable_canonical_uris
@@ -71,10 +72,14 @@ func (fsrv *FileServer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	switch len(args) {
 	case 0:
 	case 1:
-		if args[0] != "browse" {
+		switch args[0] {
+		case "browse":
+			fsrv.Browse = new(Browse)
+		case "snapshot":
+			fsrv.Snapshot = &Snapshot{Hash: snapshotHashMetadata}
+		default:
 			return d.ArgErr()
 		}
-		fsrv.Browse = new(Browse)
 	default:
 		return d.ArgErr()
 	}
@@ -149,6 +154,61 @@ func (fsrv *FileServer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					fsrv.Browse.FileLimit = val
 				default:
 					return d.Errf("unknown subdirective '%s'", d.Val())
+				}
+			}
+
+		case "snapshot":
+			if fsrv.Snapshot != nil {
+				return d.Err("snapshot is already configured")
+			}
+			fsrv.Snapshot = &Snapshot{}
+			snapArgs := d.RemainingArgs()
+			if len(snapArgs) > 1 {
+				return d.ArgErr()
+			}
+			if len(snapArgs) == 1 {
+				fsrv.Snapshot.Hash = snapArgs[0]
+			}
+			for nesting := d.Nesting(); d.NextBlock(nesting); {
+				switch d.Val() {
+				case "hash":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					if fsrv.Snapshot.Hash != "" {
+						return d.Err("snapshot hash is already specified")
+					}
+					fsrv.Snapshot.Hash = d.Val()
+				case "follow_symlinks":
+					if d.NextArg() {
+						return d.ArgErr()
+					}
+					if fsrv.Snapshot.FollowSymlinks {
+						return d.Err("following symlinks is already enabled")
+					}
+					fsrv.Snapshot.FollowSymlinks = true
+				case "reveal_symlinks":
+					if d.NextArg() {
+						return d.ArgErr()
+					}
+					if fsrv.Snapshot.RevealSymlinks {
+						return d.Err("symlink reveal is already enabled")
+					}
+					fsrv.Snapshot.RevealSymlinks = true
+				case "file_limit":
+					if !d.NextArg() {
+						return d.ArgErr()
+					}
+					if fsrv.Snapshot.FileLimit != 0 {
+						return d.Err("snapshot file_limit is already configured")
+					}
+					fileLimit, err := strconv.Atoi(d.Val())
+					if err != nil || fileLimit <= 0 {
+						return d.Err("snapshot file_limit must be a positive integer")
+					}
+					fsrv.Snapshot.FileLimit = fileLimit
+				default:
+					return d.Errf("unknown snapshot subdirective '%s'", d.Val())
 				}
 			}
 

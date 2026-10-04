@@ -81,6 +81,14 @@ func init() {
 // with sub-second precision. For any other value for the `Accept` header, the
 // respective browse template is executed with `Content-Type: text/html`.
 //
+// If the "snapshot" parameter is configured, directory requests that
+// include the `?snapshot` query parameter (or an Accept header of
+// application/vnd.caddy.snapshot+json) instead return a recursive JSON
+// manifest of the directory tree with a content-derived ETag. The
+// manifest is generated with a single filesystem walk per request,
+// honors the hide and symlink configuration, includes per-file ETags,
+// and supports the standard conditional request headers.
+//
 // By default, this handler will canonicalize URIs so that requests to
 // directories end with a slash, but requests to regular files do not.
 // This is enforced with HTTP redirects automatically and can be disabled.
@@ -141,6 +149,14 @@ type FileServer struct {
 	// Enables file listings if a directory was requested and no index
 	// file is present.
 	Browse *Browse `json:"browse,omitempty"`
+
+	// Enables atomic directory snapshots: machine-consumable manifests
+	// of an entire directory tree, requested with the `?snapshot`
+	// query parameter (or via content negotiation). The manifest is
+	// generated per request over the configured filesystem, honors
+	// hide and symlink settings, and supports the usual conditional
+	// request headers and per-file ETags.
+	Snapshot *Snapshot `json:"snapshot,omitempty"`
 
 	// Use redirects to enforce trailing slashes for directories, or to
 	// remove trailing slash from URIs for files. Default is true.
@@ -264,6 +280,19 @@ func (fsrv *FileServer) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	if fsrv.Snapshot != nil {
+		switch fsrv.Snapshot.Hash {
+		case "", snapshotHashMetadata:
+			fsrv.Snapshot.Hash = snapshotHashMetadata
+		case snapshotHashSHA256:
+		default:
+			return fmt.Errorf("snapshot hash must be %q or %q, got %q", snapshotHashMetadata, snapshotHashSHA256, fsrv.Snapshot.Hash)
+		}
+		if fsrv.Snapshot.FileLimit < 0 {
+			return fmt.Errorf("snapshot file_limit must be a positive number, got %d", fsrv.Snapshot.FileLimit)
+		}
+	}
+
 	return nil
 }
 
@@ -367,6 +396,13 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			return caddyhttp.Error(http.StatusForbidden, err)
 		}
 		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	// an explicitly requested directory snapshot is handled before
+	// index resolution, so a manifest of the tree is available even
+	// when the directory contains an index file
+	if info.IsDir() && fsrv.snapshotRequested(r) && !fileHidden(filename, filesToHide) {
+		return fsrv.serveSnapshot(fileSystem, fsName, filename, info, w, r, next)
 	}
 
 	// if the request mapped to a directory, see if
