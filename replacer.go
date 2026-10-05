@@ -133,6 +133,52 @@ func (r *Replacer) DeleteByPrefix(prefix string) {
 	r.mapMutex.Unlock()
 }
 
+// ReplacerSnapshot is a restorable, point-in-time copy of a Replacer's
+// mutable state: its static placeholder values and its registered
+// replacement providers. It is obtained with Replacer.Snapshot and
+// applied with Replacer.Restore.
+//
+// A snapshot only records which static values and providers exist; it
+// does not deep-copy values referenced by providers (for example, an
+// HTTP request a provider closes over). Like the Replacer itself, a
+// snapshot is intended for use by a single goroutine for the lifetime
+// of one request and must not be shared across concurrent requests.
+type ReplacerSnapshot struct {
+	static    map[string]any
+	providers []replacementProvider
+}
+
+// Snapshot returns a restorable copy of the replacer's current state.
+func (r *Replacer) Snapshot() ReplacerSnapshot {
+	r.mapMutex.RLock()
+	static := make(map[string]any, len(r.static))
+	for k, v := range r.static {
+		static[k] = v
+	}
+	r.mapMutex.RUnlock()
+
+	providers := append([]replacementProvider(nil), r.providers...)
+
+	return ReplacerSnapshot{static: static, providers: providers}
+}
+
+// Restore reverts the replacer to the state captured by s: static values
+// set after the snapshot are removed, values removed after the snapshot
+// are reinstated, and providers registered after the snapshot are
+// dropped. The snapshot is not consumed and may be restored more than
+// once.
+func (r *Replacer) Restore(s ReplacerSnapshot) {
+	providers := append([]replacementProvider(nil), s.providers...)
+
+	r.mapMutex.Lock()
+	r.providers = providers
+	clear(r.static)
+	for k, v := range s.static {
+		r.static[k] = v
+	}
+	r.mapMutex.Unlock()
+}
+
 // fromStatic provides values from r.static.
 func (r *Replacer) fromStatic(key string) (any, bool) {
 	r.mapMutex.RLock()

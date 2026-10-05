@@ -1,0 +1,132 @@
+:9080 {
+	rewrite /a /one {
+		transaction rollback_on_error rollback_on_cancel
+	}
+
+	rewrite /b /two {
+		transaction {
+			rollback_on_error
+		}
+	}
+
+	rewrite /c /three {
+		transaction commit
+	}
+
+	method POST {
+		transaction rollback_on_error
+	}
+
+	uri strip_prefix /api
+
+	uri transaction rollback_on_cancel
+
+	uri transaction rollback_on_error rollback_on_cancel
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":9080"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handler": "rewrite",
+									"method": "POST",
+									"transaction": {
+										"on_error": "rollback"
+									}
+								}
+							]
+						},
+						{
+							"group": "group0",
+							"match": [
+								{
+									"path": [
+										"/a"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "rewrite",
+									"transaction": {
+										"on_cancel": "rollback",
+										"on_error": "rollback"
+									},
+									"uri": "/one"
+								}
+							]
+						},
+						{
+							"group": "group0",
+							"match": [
+								{
+									"path": [
+										"/b"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "rewrite",
+									"transaction": {
+										"on_error": "rollback"
+									},
+									"uri": "/two"
+								}
+							]
+						},
+						{
+							"group": "group0",
+							"match": [
+								{
+									"path": [
+										"/c"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "rewrite",
+									"transaction": {
+										"on_cancel": "commit",
+										"on_error": "commit"
+									},
+									"uri": "/three"
+								}
+							]
+						},
+						{
+							"handle": [
+								{
+									"handler": "rewrite",
+									"strip_path_prefix": "/api"
+								},
+								{
+									"handler": "rewrite",
+									"transaction": {
+										"on_cancel": "rollback"
+									}
+								},
+								{
+									"handler": "rewrite",
+									"transaction": {
+										"on_cancel": "rollback",
+										"on_error": "rollback"
+									}
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}

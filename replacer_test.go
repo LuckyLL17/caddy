@@ -484,6 +484,57 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerSnapshotRestore(t *testing.T) {
+	rep := NewReplacer()
+	rep.Set("kept", "one")
+	rep.Set("removed_later", "original")
+	rep.Map(func(key string) (any, bool) {
+		if key == "provider.kept" {
+			return "from-kept-provider", true
+		}
+		return nil, false
+	})
+
+	snap := rep.Snapshot()
+
+	// mutate state after the checkpoint: set, overwrite, delete, and
+	// register an additional provider
+	rep.Set("added", "two")
+	rep.Set("removed_later", "overwritten")
+	rep.Delete("removed_later")
+	rep.Map(func(key string) (any, bool) {
+		if key == "provider.added" {
+			return "from-added-provider", true
+		}
+		return nil, false
+	})
+
+	rep.Restore(snap)
+
+	if v, ok := rep.GetString("kept"); !ok || v != "one" {
+		t.Errorf("expected checkpoint static value to remain, got %q/%v", v, ok)
+	}
+	if v, ok := rep.GetString("removed_later"); !ok || v != "original" {
+		t.Errorf("expected deleted value to be reinstated, got %q/%v", v, ok)
+	}
+	if _, ok := rep.Get("added"); ok {
+		t.Error("expected value set after the snapshot to be removed")
+	}
+	if v, ok := rep.GetString("provider.kept"); !ok || v != "from-kept-provider" {
+		t.Errorf("expected checkpoint provider to remain, got %q/%v", v, ok)
+	}
+	if _, ok := rep.Get("provider.added"); ok {
+		t.Error("expected provider registered after the snapshot to be dropped")
+	}
+
+	// restoring is repeatable: later mutations roll back to the same state
+	rep.Set("added", "two")
+	rep.Restore(snap)
+	if _, ok := rep.Get("added"); ok {
+		t.Error("expected repeated restore to remove newly added values")
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string

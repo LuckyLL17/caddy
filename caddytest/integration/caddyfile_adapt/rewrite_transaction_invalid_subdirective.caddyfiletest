@@ -1,0 +1,7 @@
+:9080 {
+	rewrite /a /one {
+		not_a_thing
+	}
+}
+----------
+unrecognized subdirective: not_a_thing

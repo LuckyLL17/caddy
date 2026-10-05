@@ -92,6 +92,12 @@ type Rewrite struct {
 	// Mutates the query string of the URI.
 	Query *queryOps `json:"query,omitempty"`
 
+	// Optionally wraps the rewrite in a request-change transaction that
+	// can restore a checkpoint taken before the rewrite when the
+	// downstream handler chain errors or is canceled. When unset, no
+	// checkpoint is taken and request handling is unchanged.
+	Transaction *Transaction `json:"transaction,omitempty"`
+
 	logger *zap.Logger
 }
 
@@ -129,27 +135,54 @@ func (rewr *Rewrite) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// Validate ensures that the transaction policies are recognized.
+func (rewr *Rewrite) Validate() error {
+	if rewr.Transaction != nil {
+		return rewr.Transaction.validate()
+	}
+	return nil
+}
+
 func (rewr Rewrite) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	const message = "rewrote request"
 
+	// the transaction checkpoint is a local value: it is allocated per
+	// invocation and never shared, so concurrent requests cannot
+	// contaminate each other
+	var checkpoint *requestSnapshot
+	if rewr.Transaction != nil {
+		snap := takeSnapshot(r, repl)
+		checkpoint = &snap
+	}
+
 	c := rewr.logger.Check(zap.DebugLevel, message)
+
+	var err error
 	if c == nil {
 		rewr.Rewrite(r, repl)
-		return next.ServeHTTP(w, r)
+		err = next.ServeHTTP(w, r)
+	} else {
+		changed := rewr.Rewrite(r, repl)
+
+		if changed {
+			c.Write(
+				zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
+				zap.String("method", r.Method),
+				zap.String("uri", r.RequestURI),
+			)
+		}
+
+		err = next.ServeHTTP(w, r)
 	}
 
-	changed := rewr.Rewrite(r, repl)
-
-	if changed {
-		c.Write(
-			zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
-			zap.String("method", r.Method),
-			zap.String("uri", r.RequestURI),
-		)
+	// decide the transaction exactly once; a rollback only restores
+	// state, it never changes the error that is propagated
+	if checkpoint != nil && rewr.Transaction.shouldRollback(r, err) {
+		checkpoint.restore(r, repl)
 	}
 
-	return next.ServeHTTP(w, r)
+	return err
 }
 
 // rewrite performs the rewrites on r using repl, which should
@@ -775,5 +808,8 @@ type queryOpsReplacement struct {
 	re *regexp.Regexp
 }
 
-// Interface guard
-var _ caddyhttp.MiddlewareHandler = (*Rewrite)(nil)
+// Interface guards
+var (
+	_ caddyhttp.MiddlewareHandler = (*Rewrite)(nil)
+	_ caddy.Validator             = (*Rewrite)(nil)
+)

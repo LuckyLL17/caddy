@@ -1,0 +1,7 @@
+:9080 {
+	rewrite /a /one {
+		transaction rollback_on_tuesdays
+	}
+}
+----------
+unrecognized transaction policy 'rollback_on_tuesdays'; must be commit, rollback_on_error, or rollback_on_cancel

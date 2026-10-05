@@ -49,6 +49,37 @@ func newVarsTestRequest(t *testing.T, target string, headers http.Header, vars m
 	return req, repl
 }
 
+func TestSnapshotVarsRestore(t *testing.T) {
+	req, _ := newVarsTestRequest(t, "", nil, map[string]any{"kept": "one", "removed_later": "original"})
+	ctx := req.Context()
+
+	// a reference to the variable table obtained before the restore must
+	// observe the restored state because restore mutates the table in place
+	table := ctx.Value(VarsCtxKey).(map[string]any)
+
+	snap := SnapshotVars(ctx)
+	SetVar(ctx, "added", "two")
+	SetVar(ctx, "removed_later", nil) // deletes the key
+
+	snap.Restore(ctx)
+
+	if v := GetVar(ctx, "kept"); v != "one" {
+		t.Errorf("expected checkpoint variable to remain, got %v", v)
+	}
+	if v := GetVar(ctx, "removed_later"); v != "original" {
+		t.Errorf("expected removed variable to be reinstated, got %v", v)
+	}
+	if v := GetVar(ctx, "added"); v != nil {
+		t.Errorf("expected variable set after the snapshot to be gone, got %v", v)
+	}
+	if table["kept"] != "one" || table["removed_later"] != "original" {
+		t.Error("restore replaced the table instead of mutating it in place")
+	}
+
+	// a context without a variable table is a no-op rather than a panic
+	SnapshotVars(context.Background()).Restore(context.Background())
+}
+
 func TestVarsMatcherDoesNotExpandResolvedValues(t *testing.T) {
 	t.Setenv("CADDY_VARS_TEST_SECRET", "topsecret")
 

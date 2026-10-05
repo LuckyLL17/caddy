@@ -34,7 +34,9 @@ func init() {
 
 // parseCaddyfileRewrite sets up a basic rewrite handler from Caddyfile tokens. Syntax:
 //
-//	rewrite [<matcher>] <to>
+//	rewrite [<matcher>] <to> {
+//	    transaction <policy...>
+//	}
 //
 // Only URI components which are given in <to> will be set in the resulting URI.
 // See the docs for the rewrite handler for more information.
@@ -51,27 +53,97 @@ func parseCaddyfileRewrite(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue,
 	}
 
 	// with only one arg, assume it's a rewrite URI with no matcher token
+	var userMatcherSet caddy.ModuleMap
 	if argsCount == 1 {
 		if !h.NextArg() {
 			return nil, h.ArgErr()
 		}
-		return h.NewRoute(nil, Rewrite{URI: h.Val()}), nil
+	} else {
+		// parse the matcher token into a matcher set
+		var err error
+		userMatcherSet, err = h.ExtractMatcherSet()
+		if err != nil {
+			return nil, err
+		}
+		h.Next() // consume directive name again, matcher parsing does a reset
+		h.Next() // advance to the rewrite URI
 	}
 
-	// parse the matcher token into a matcher set
-	userMatcherSet, err := h.ExtractMatcherSet()
-	if err != nil {
-		return nil, err
-	}
-	h.Next() // consume directive name again, matcher parsing does a reset
-	h.Next() // advance to the rewrite URI
+	rewr := Rewrite{URI: h.Val()}
 
-	return h.NewRoute(userMatcherSet, Rewrite{URI: h.Val()}), nil
+	for nesting := h.Nesting(); h.NextBlock(nesting); {
+		switch h.Val() {
+		case "transaction":
+			txn, err := parseCaddyfileTransaction(h, h.RemainingArgs())
+			if err != nil {
+				return nil, err
+			}
+			rewr.Transaction = txn
+		default:
+			return nil, h.Errf("unrecognized subdirective: %s", h.Val())
+		}
+	}
+
+	return h.NewRoute(userMatcherSet, rewr), nil
+}
+
+// parseCaddyfileTransaction parses transaction policies while the
+// dispenser is positioned on the "transaction" token. Syntax:
+//
+//	transaction [commit|rollback_on_error|rollback_on_cancel]... {
+//	    commit
+//	    rollback_on_error
+//	    rollback_on_cancel
+//	}
+//
+// Policies are applied in the order they are written: commit affirms
+// the default commit outcome for both triggers, while rollback_on_error
+// and rollback_on_cancel opt into restoring the checkpoint on error
+// and cancellation respectively.
+func parseCaddyfileTransaction(h httpcaddyfile.Helper, inlineArgs []string) (*Transaction, error) {
+	txn := &Transaction{}
+
+	apply := func(token string) error {
+		switch token {
+		case "commit":
+			txn.OnError = transactionPolicyCommit
+			txn.OnCancel = transactionPolicyCommit
+		case "rollback_on_error":
+			txn.OnError = transactionPolicyRollback
+		case "rollback_on_cancel":
+			txn.OnCancel = transactionPolicyRollback
+		default:
+			return h.Errf("unrecognized transaction policy '%s'; must be commit, rollback_on_error, or rollback_on_cancel", token)
+		}
+		return nil
+	}
+
+	for _, token := range inlineArgs {
+		if err := apply(token); err != nil {
+			return nil, err
+		}
+	}
+
+	for nesting := h.Nesting(); h.NextBlock(nesting); {
+		lineArgs := h.RemainingArgs()
+		if len(lineArgs) == 0 {
+			lineArgs = []string{h.Val()}
+		}
+		for _, token := range lineArgs {
+			if err := apply(token); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return txn, nil
 }
 
 // parseCaddyfileMethod sets up a basic method rewrite handler from Caddyfile tokens. Syntax:
 //
-//	method [<matcher>] <method>
+//	method [<matcher>] <method> {
+//	    transaction <policy...>
+//	}
 func parseCaddyfileMethod(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	h.Next() // consume directive name
 	if !h.NextArg() {
@@ -80,20 +152,39 @@ func parseCaddyfileMethod(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, 
 	if h.NextArg() {
 		return nil, h.ArgErr()
 	}
-	return Rewrite{Method: h.Val()}, nil
+
+	rewr := Rewrite{Method: h.Val()}
+
+	for nesting := h.Nesting(); h.NextBlock(nesting); {
+		switch h.Val() {
+		case "transaction":
+			txn, err := parseCaddyfileTransaction(h, h.RemainingArgs())
+			if err != nil {
+				return nil, err
+			}
+			rewr.Transaction = txn
+		default:
+			return nil, h.Errf("unrecognized subdirective: %s", h.Val())
+		}
+	}
+
+	return rewr, nil
 }
 
 // parseCaddyfileURI sets up a handler for manipulating (but not "rewriting") the
 // URI from Caddyfile tokens. Syntax:
 //
 //	uri [<matcher>] strip_prefix|strip_suffix|replace|path_regexp <target> [<replacement> [<limit>]]
+//	uri [<matcher>] transaction [commit|rollback_on_error|rollback_on_cancel]...
 //
 // If strip_prefix or strip_suffix are used, then <target> will be stripped
 // only if it is the beginning or the end, respectively, of the URI path. If
 // replace is used, then <target> will be replaced with <replacement> across
 // the whole URI, up to <limit> times (or unlimited if unspecified). If
 // path_regexp is used, then regular expression replacements will be performed
-// on the path portion of the URI (and a limit cannot be set).
+// on the path portion of the URI (and a limit cannot be set). If transaction
+// is used, a request-change transaction is configured as on the rewrite
+// directive.
 func parseCaddyfileURI(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	h.Next() // consume directive name
 
@@ -181,6 +272,13 @@ func parseCaddyfileURI(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, err
 				return nil, err
 			}
 		}
+
+	case "transaction":
+		txn, err := parseCaddyfileTransaction(h, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		rewr.Transaction = txn
 
 	default:
 		return nil, h.Errf("unrecognized URI manipulation '%s'", args[0])

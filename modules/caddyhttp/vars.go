@@ -478,6 +478,47 @@ func SetVar(ctx context.Context, key string, value any) {
 	varMap[key] = value
 }
 
+// VarsSnapshot is a restorable, point-in-time copy of a request's
+// variable table, the storage behind {http.vars.*} placeholders. It is
+// obtained with SnapshotVars and applied with VarsSnapshot.Restore.
+//
+// Like the variable table it copies, a snapshot is scoped to a single
+// request and must not be shared across concurrent requests.
+type VarsSnapshot struct {
+	vars map[string]any
+}
+
+// SnapshotVars returns a restorable copy of the variable table in ctx.
+// If ctx has no variable table, the zero snapshot is returned and
+// restoring it is a no-op.
+func SnapshotVars(ctx context.Context) VarsSnapshot {
+	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
+	if !ok {
+		return VarsSnapshot{}
+	}
+	snap := make(map[string]any, len(varMap))
+	for k, v := range varMap {
+		snap[k] = v
+	}
+	return VarsSnapshot{vars: snap}
+}
+
+// Restore reverts the variable table in ctx to the state captured by s:
+// variables set after the snapshot are removed and removed variables
+// are reinstated. It does not replace the table in ctx, so references
+// obtained earlier observe the restored values. The snapshot is not
+// consumed and may be restored more than once.
+func (s VarsSnapshot) Restore(ctx context.Context) {
+	varMap, ok := ctx.Value(VarsCtxKey).(map[string]any)
+	if !ok {
+		return
+	}
+	clear(varMap)
+	for k, v := range s.vars {
+		varMap[k] = v
+	}
+}
+
 // Interface guards
 var (
 	_ MiddlewareHandler       = (*VarsMiddleware)(nil)
