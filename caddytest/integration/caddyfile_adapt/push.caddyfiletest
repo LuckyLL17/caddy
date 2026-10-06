@@ -16,6 +16,23 @@ push {
 		Foo bar
 	}
 }
+
+push {
+	/foo.txt
+	plan {
+		source both
+		order link_first
+		max_resources 10
+		budget 1MiB
+		on_error continue
+	}
+}
+
+push {
+	plan {
+		source configured
+	}
+}
 ----------
 {
 	"apps": {
@@ -66,6 +83,27 @@ push {
 												"bar"
 											]
 										}
+									}
+								},
+								{
+									"handler": "push",
+									"plan": {
+										"budget": 1048576,
+										"max_resources": 10,
+										"on_error": "continue",
+										"order": "link_first",
+										"source": "both"
+									},
+									"resources": [
+										{
+											"target": "/foo.txt"
+										}
+									]
+								},
+								{
+									"handler": "push",
+									"plan": {
+										"source": "configured"
 									}
 								}
 							]

@@ -15,6 +15,10 @@
 package push
 
 import (
+	"strconv"
+
+	"github.com/dustin/go-humanize"
+
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
@@ -32,6 +36,13 @@ func init() {
 //	        [+]<field> [<value|regexp> [<replacement>]]
 //	        -<field>
 //	    }
+//	    plan {
+//	        source    <configured|link|both>
+//	        order     <configured_first|link_first>
+//	        max_resources <n>
+//	        budget    <size>
+//	        on_error  <abort|continue>
+//	    }
 //	}
 //
 // A single resource can be specified inline without opening a
@@ -41,8 +52,10 @@ func init() {
 // subdirective can be used to customize the headers that
 // are set on each (synthetic) push request, using the same
 // syntax as the 'header' directive for request headers.
-// Placeholders are accepted in resource and header field
-// name and value and replacement tokens.
+// The plan subdirective gathers configured and Link resources
+// into one deterministic, de-duplicated and bounded plan for
+// every request. Placeholders are accepted in resource and
+// header field name and value and replacement tokens.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	h.Next() // consume directive name
 
@@ -88,6 +101,18 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 			}
 
+		case "plan":
+			if h.NextArg() {
+				return nil, h.ArgErr()
+			}
+			if handler.Plan != nil {
+				return nil, h.Err("plan already specified")
+			}
+			handler.Plan = new(ResourcePlan)
+			if err := parsePlanCaddyfile(h, handler.Plan); err != nil {
+				return nil, err
+			}
+
 		case "GET", "HEAD":
 			method := h.Val()
 			if !h.NextArg() {
@@ -104,4 +129,94 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 		}
 	}
 	return handler, nil
+}
+
+// parsePlanCaddyfile parses the plan block:
+//
+//	plan {
+//	    source        <configured|link|both>
+//	    order         <configured_first|link_first>
+//	    max_resources <n>
+//	    budget        <size>
+//	    on_error      <abort|continue>
+//	}
+func parsePlanCaddyfile(h httpcaddyfile.Helper, plan *ResourcePlan) error {
+	for nesting := h.Nesting(); h.NextBlock(nesting); {
+		switch h.Val() {
+		case "source":
+			if !h.NextArg() {
+				return h.ArgErr()
+			}
+			if h.NextArg() {
+				return h.ArgErr()
+			}
+			switch h.Val() {
+			case sourceConfigured, sourceLink, sourceBoth:
+				plan.Source = h.Val()
+			default:
+				return h.Errf("source must be one of %q, %q, or %q, got: %s",
+					sourceConfigured, sourceLink, sourceBoth, h.Val())
+			}
+
+		case "order":
+			if !h.NextArg() {
+				return h.ArgErr()
+			}
+			if h.NextArg() {
+				return h.ArgErr()
+			}
+			switch h.Val() {
+			case orderConfiguredFirst, orderLinkFirst:
+				plan.Order = h.Val()
+			default:
+				return h.Errf("order must be %q or %q, got: %s",
+					orderConfiguredFirst, orderLinkFirst, h.Val())
+			}
+
+		case "max_resources":
+			if !h.NextArg() {
+				return h.ArgErr()
+			}
+			if h.NextArg() {
+				return h.ArgErr()
+			}
+			maxResources, err := strconv.Atoi(h.Val())
+			if err != nil || maxResources < 0 {
+				return h.Errf("max_resources must be a non-negative integer, got: %s", h.Val())
+			}
+			plan.MaxResources = maxResources
+
+		case "budget":
+			if !h.NextArg() {
+				return h.ArgErr()
+			}
+			if h.NextArg() {
+				return h.ArgErr()
+			}
+			budget, err := humanize.ParseBytes(h.Val())
+			if err != nil {
+				return h.Errf("budget must be a byte size such as 1MB or 1048576, got: %s", h.Val())
+			}
+			plan.Budget = int64(budget)
+
+		case "on_error":
+			if !h.NextArg() {
+				return h.ArgErr()
+			}
+			if h.NextArg() {
+				return h.ArgErr()
+			}
+			switch h.Val() {
+			case errorAbort, errorContinue:
+				plan.OnError = h.Val()
+			default:
+				return h.Errf("on_error must be %q or %q, got: %s",
+					errorAbort, errorContinue, h.Val())
+			}
+
+		default:
+			return h.Errf("unrecognized plan subdirective: %s", h.Val())
+		}
+	}
+	return nil
 }

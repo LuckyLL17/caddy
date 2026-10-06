@@ -50,6 +50,12 @@ type Handler struct {
 	// Headers to modify for the push requests.
 	Headers *HeaderConfig `json:"headers,omitempty"`
 
+	// Plan optionally gathers configured and Link resources
+	// into one deterministic, de-duplicated and bounded push
+	// plan per request. When unset, configured resources and
+	// Link header resources are pushed without planning.
+	Plan *ResourcePlan `json:"plan,omitempty"`
+
 	logger *zap.Logger
 }
 
@@ -64,10 +70,23 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision sets up h.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
+	if h.Plan != nil {
+		h.Plan.normalize()
+	}
 	if h.Headers != nil {
 		err := h.Headers.Provision(ctx)
 		if err != nil {
 			return fmt.Errorf("provisioning header operations: %v", err)
+		}
+	}
+	return nil
+}
+
+// Validate ensures h is configured correctly.
+func (h Handler) Validate() error {
+	if h.Plan != nil {
+		if err := h.Plan.Validate(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -84,6 +103,56 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return next.ServeHTTP(w, r)
 	}
 
+	if h.Plan == nil {
+		return h.serveLegacy(w, r, next, pusher)
+	}
+	return h.servePlanned(w, r, next, pusher)
+}
+
+// servePlanned runs the optional resource plan: configured
+// resources and Link header resources are admitted into one plan
+// with deterministic ordering, canonical de-duplication and
+// per-request bounds.
+func (h Handler) servePlanned(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, pusher http.Pusher) error {
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	server := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
+	shouldLogCredentials := server.Logs != nil && server.Logs.ShouldLogCredentials
+
+	// one header snapshot per request for every push attempt
+	hdr := h.initializePushHeaders(r, repl)
+
+	planner := newPushPlanner(h, *h.Plan, pusher, hdr, r, repl, shouldLogCredentials)
+
+	useLinks := planner.plan.includes(sourceLink)
+
+	// push configured resources before the response is produced;
+	// in link-first order they are deferred to the Link phase
+	planner.commitConfiguredPhase()
+
+	if !useLinks {
+		return next.ServeHTTP(w, r)
+	}
+
+	// intercept the first response write so Link resources can be
+	// planned and pushed before the response headers are sent
+	lp := &plannedLinkPusher{
+		ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w},
+		planner:               planner,
+	}
+	serveErr := next.ServeHTTP(lp, r)
+
+	// if the response was never written through the wrapper, the
+	// deferred Link phase still gets exactly one chance; this also
+	// commits configured resources in link-first order
+	lp.finish()
+
+	return serveErr
+}
+
+// serveLegacy preserves the original, unplanned behavior: push
+// configured resources before the handler runs, then push Link
+// resources when the response headers are written.
+func (h Handler) serveLegacy(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, pusher http.Pusher) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	server := r.Context().Value(caddyhttp.ServerCtxKey).(*caddyhttp.Server)
 	shouldLogCredentials := server.Logs != nil && server.Logs.ShouldLogCredentials
@@ -223,6 +292,63 @@ func (lp linkPusher) WriteHeader(statusCode int) {
 	lp.ResponseWriter.WriteHeader(statusCode)
 }
 
+// plannedLinkPusher intercepts the first point at which the
+// response is written and commits the deferred Link phase of a
+// resource plan once, based on a snapshot of the response
+// headers. Later writes, repeated WriteHeader calls, flushes and
+// header mutations after the response has started do not trigger
+// additional pushes.
+type plannedLinkPusher struct {
+	*caddyhttp.ResponseWriterWrapper
+	planner   *pushPlanner
+	committed bool
+}
+
+// finish commits the Link phase if no response write was
+// intercepted; safe to call more than once.
+func (lp *plannedLinkPusher) finish() {
+	lp.beforeResponseWrite()
+}
+
+func (lp *plannedLinkPusher) beforeResponseWrite() {
+	if lp.committed {
+		return
+	}
+	lp.committed = true
+	lp.planner.commitLinkPhase(snapshotLinks(lp.ResponseWriter.Header()))
+}
+
+func (lp *plannedLinkPusher) WriteHeader(statusCode int) {
+	lp.beforeResponseWrite()
+	lp.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (lp *plannedLinkPusher) Write(b []byte) (int, error) {
+	lp.beforeResponseWrite()
+	return lp.ResponseWriter.Write(b)
+}
+
+// Flush flushes buffered data to the client, committing any
+// pending Link resources first.
+func (lp *plannedLinkPusher) Flush() {
+	lp.beforeResponseWrite()
+	if flusher, ok := lp.ResponseWriterWrapper.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// snapshotLinks copies the Link response header field values so
+// that later mutations cannot change the plan.
+func snapshotLinks(hdr http.Header) []string {
+	links := hdr["Link"]
+	if len(links) == 0 {
+		return nil
+	}
+	snapshot := make([]string, len(links))
+	copy(snapshot, links)
+	return snapshot
+}
+
 // isRemoteResource returns true if resource starts with
 // a scheme or is a protocol-relative URI.
 func isRemoteResource(resource string) bool {
@@ -257,7 +383,10 @@ const pushedLink = "http.handlers.push.pushed_link"
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
+	_ caddy.Validator             = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ http.ResponseWriter         = (*linkPusher)(nil)
 	_ http.Pusher                 = (*linkPusher)(nil)
+	_ http.ResponseWriter         = (*plannedLinkPusher)(nil)
+	_ http.Flusher                = (*plannedLinkPusher)(nil)
 )
