@@ -133,6 +133,29 @@ func (r *Replacer) DeleteByPrefix(prefix string) {
 	r.mapMutex.Unlock()
 }
 
+// Snapshot returns a shallow copy of the replacer's static
+// replacements. It can be passed to Restore to discard
+// static replacements that were set after the snapshot.
+// Dynamic providers registered with Map are not included.
+func (r *Replacer) Snapshot() map[string]any {
+	r.mapMutex.RLock()
+	snap := make(map[string]any, len(r.static))
+	for k, v := range r.static {
+		snap[k] = v
+	}
+	r.mapMutex.RUnlock()
+	return snap
+}
+
+// Restore replaces the static replacements with snap, which
+// should have been obtained from Snapshot. The caller must
+// not retain or mutate snap after passing it to Restore.
+func (r *Replacer) Restore(snap map[string]any) {
+	r.mapMutex.Lock()
+	r.static = snap
+	r.mapMutex.Unlock()
+}
+
 // fromStatic provides values from r.static.
 func (r *Replacer) fromStatic(key string) (any, bool) {
 	r.mapMutex.RLock()

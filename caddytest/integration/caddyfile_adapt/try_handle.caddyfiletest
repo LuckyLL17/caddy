@@ -1,0 +1,154 @@
+:80 {
+	try_handle {
+		max_attempts 3
+		fallback_status 502 503 5xx
+		error_status 503
+		error_match @retryable
+		on_exhausted commit
+		request_body_buffer 1MB
+		response_body_buffer 10MB
+
+		@retryable expression {http.error.message}.startsWith("dial")
+		@slow {
+			status 504
+			header Retry-After *
+		}
+		fallback_match @slow
+
+		handle /cache/* {
+			reverse_proxy 127.0.0.1:9001
+		}
+		handle_path /api/* {
+			reverse_proxy 127.0.0.1:9002
+		}
+		handle {
+			respond "maintenance" 503
+		}
+	}
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":80"
+					],
+					"routes": [
+						{
+							"handle": [
+								{
+									"branches": [
+										{
+											"match": [
+												{
+													"path": [
+														"/cache/*"
+													]
+												}
+											],
+											"routes": [
+												{
+													"handle": [
+														{
+															"handler": "reverse_proxy",
+															"upstreams": [
+																{
+																	"dial": "127.0.0.1:9001"
+																}
+															]
+														}
+													]
+												}
+											]
+										},
+										{
+											"match": [
+												{
+													"path": [
+														"/api/*"
+													]
+												}
+											],
+											"routes": [
+												{
+													"handle": [
+														{
+															"handler": "rewrite",
+															"strip_path_prefix": "/api"
+														}
+													]
+												},
+												{
+													"handle": [
+														{
+															"handler": "reverse_proxy",
+															"upstreams": [
+																{
+																	"dial": "127.0.0.1:9002"
+																}
+															]
+														}
+													]
+												}
+											]
+										},
+										{
+											"routes": [
+												{
+													"handle": [
+														{
+															"body": "maintenance",
+															"handler": "static_response",
+															"status_code": 503
+														}
+													]
+												}
+											]
+										}
+									],
+									"fallback": {
+										"error_match": [
+											{
+												"expression": {
+													"expr": "{http.error.message}.startsWith(\"dial\")",
+													"name": "retryable"
+												}
+											}
+										],
+										"error_status_codes": [
+											503
+										],
+										"max_attempts": 3,
+										"on_exhausted": "commit",
+										"request_body_buffer": 1000000,
+										"response_body_buffer": 10000000,
+										"response_matchers": [
+											{
+												"headers": {
+													"Retry-After": [
+														"*"
+													]
+												},
+												"status_code": [
+													504
+												]
+											}
+										],
+										"status_codes": [
+											502,
+											503,
+											5
+										]
+									},
+									"handler": "handle"
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}

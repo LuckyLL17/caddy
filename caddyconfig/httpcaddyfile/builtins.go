@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/dustin/go-humanize"
 	"github.com/mholt/acmez/v3/acme"
 	"go.uber.org/zap/zapcore"
 
@@ -47,6 +48,7 @@ func init() {
 	RegisterHandlerDirective("error", parseError)
 	RegisterHandlerDirective("route", parseRoute)
 	RegisterHandlerDirective("handle", parseHandle)
+	RegisterHandlerDirective("try_handle", parseTryHandle)
 	RegisterDirective("handle_errors", parseHandleErrors)
 	RegisterHandlerDirective("invoke", parseInvoke)
 	RegisterDirective("log", parseLog)
@@ -898,6 +900,238 @@ func parseHandleErrors(h Helper) ([]ConfigValue, error) {
 			Value: subroute,
 		},
 	}, nil
+}
+
+// parseTryHandle parses the try_handle directive, which executes
+// ordered handle blocks as fallback candidates. Syntax:
+//
+//	try_handle [<matcher>] {
+//	    max_attempts <n>
+//	    fallback_status <code...>
+//	    fallback_match <matcher...>
+//	    error_status <code...>
+//	    error_match <matcher...>
+//	    on_exhausted <commit|error>
+//	    request_body_buffer <size>
+//	    response_body_buffer <size>
+//
+//	    @responseMatcher {
+//	        status <code...>
+//	        header <field> [<value...>]
+//	    }
+//	    @requestMatcher expression <...>
+//
+//	    handle [<matcher>] {
+//	        ...
+//	    }
+//	}
+//
+// The handle blocks are the branches, in their declaration order;
+// after a fallible outcome (per the configured criteria), the next
+// matching handle block is tried.
+func parseTryHandle(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	h.Next() // consume directive name; ExtractMatcherSet reset the cursor
+
+	handler := &caddyhttp.HandleHandler{Fallback: &caddyhttp.FallbackPlan{}}
+	respMatchers := make(map[string]caddyhttp.ResponseMatcher)
+	reqMatcherDefs := make(map[string]caddy.ModuleMap)
+
+	var segments []caddyfile.Segment
+	for nesting := h.Nesting(); h.NextBlock(nesting); {
+		segments = append(segments, h.NextSegment())
+	}
+
+	// extract matcher definitions first so options and branches can
+	// reference matchers declared later in the block
+	var optionAndBranchSegments []caddyfile.Segment
+	for _, seg := range segments {
+		dir := seg.Directive()
+		if !strings.HasPrefix(dir, matcherPrefix) {
+			optionAndBranchSegments = append(optionAndBranchSegments, seg)
+			continue
+		}
+		// a definition containing only status/header tokens is a
+		// response matcher; anything else is a request matcher
+		tmpResp := make(map[string]caddyhttp.ResponseMatcher)
+		if err := caddyhttp.ParseNamedResponseMatcher(caddyfile.NewDispenser(seg), tmpResp); err == nil {
+			for name, m := range tmpResp {
+				respMatchers[name] = m
+			}
+			continue
+		}
+		if err := parseMatcherDefinitions(caddyfile.NewDispenser(seg), reqMatcherDefs); err != nil {
+			return nil, h.Errf("parsing matcher '%s': %v", dir, err)
+		}
+	}
+
+	for _, seg := range optionAndBranchSegments {
+		dir := seg.Directive()
+
+		switch {
+		case dir == "handle" || dir == "handle_path":
+			subHelper := h.WithDispenser(caddyfile.NewDispenser(seg))
+			subHelper.matcherDefs = reqMatcherDefs
+
+			dirFunc, ok := registeredDirectives[dir]
+			if !ok {
+				return nil, h.Errf("unrecognized directive: %s", dir)
+			}
+			results, err := dirFunc(subHelper)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, result := range results {
+				route, ok := result.Value.(caddyhttp.Route)
+				if !ok {
+					return nil, h.Errf("%s inside try_handle must produce an HTTP route", dir)
+				}
+				if len(route.HandlersRaw) != 1 {
+					return nil, h.Errf("internal error: unexpected output from %s", dir)
+				}
+				var sub caddyhttp.Subroute
+				if err := json.Unmarshal(route.HandlersRaw[0], &sub); err != nil {
+					return nil, h.Errf("decoding %s branch: %v", dir, err)
+				}
+				handler.Branches = append(handler.Branches, caddyhttp.HandleBranch{
+					MatcherSetsRaw: route.MatcherSetsRaw,
+					Routes:         sub.Routes,
+				})
+			}
+
+		default:
+			optHelper := h.WithDispenser(caddyfile.NewDispenser(seg))
+			if err := parseTryHandleOption(optHelper, handler.Fallback, respMatchers, reqMatcherDefs); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if len(handler.Branches) == 0 {
+		return nil, h.Err("try_handle requires at least one handle block")
+	}
+
+	return handler, nil
+}
+
+// parseTryHandleOption parses one fallback plan option line.
+func parseTryHandleOption(h Helper, plan *caddyhttp.FallbackPlan,
+	respMatchers map[string]caddyhttp.ResponseMatcher, reqMatcherDefs map[string]caddy.ModuleMap,
+) error {
+	h.Next() // consume option name
+	option := h.Val()
+
+	if h.NextBlock(h.Nesting()) {
+		return h.Errf("%s option does not accept a block", option)
+	}
+
+	args := h.RemainingArgs()
+
+	switch option {
+	case "max_attempts":
+		if len(args) != 1 {
+			return h.ArgErr()
+		}
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return h.Errf("max_attempts must be an integer, got '%s'", args[0])
+		}
+		plan.MaxAttempts = n
+
+	case "fallback_status":
+		codes, err := parseFallbackStatusCodes(h, args)
+		if err != nil {
+			return err
+		}
+		plan.StatusCodes = append(plan.StatusCodes, codes...)
+
+	case "fallback_match":
+		if len(args) == 0 {
+			return h.ArgErr()
+		}
+		for _, arg := range args {
+			if !strings.HasPrefix(arg, matcherPrefix) {
+				return h.Errf("fallback_match only accepts named response matchers, got '%s'", arg)
+			}
+			matcher, ok := respMatchers[arg]
+			if !ok {
+				return h.Errf("no response matcher named '%s' is defined in this try_handle block", arg)
+			}
+			plan.ResponseMatchers = append(plan.ResponseMatchers, &matcher)
+		}
+
+	case "error_status":
+		codes, err := parseFallbackStatusCodes(h, args)
+		if err != nil {
+			return err
+		}
+		plan.ErrorStatusCodes = append(plan.ErrorStatusCodes, codes...)
+
+	case "error_match":
+		if len(args) == 0 {
+			return h.ArgErr()
+		}
+		for _, arg := range args {
+			if !strings.HasPrefix(arg, matcherPrefix) {
+				return h.Errf("error_match only accepts named request matchers, got '%s'", arg)
+			}
+			matcher, ok := reqMatcherDefs[arg]
+			if !ok {
+				return h.Errf("no request matcher named '%s' is defined in this try_handle block", arg)
+			}
+			plan.ErrorMatcherSetsRaw = append(plan.ErrorMatcherSetsRaw, matcher)
+		}
+
+	case "on_exhausted":
+		if len(args) != 1 {
+			return h.ArgErr()
+		}
+		switch args[0] {
+		case "commit", "error":
+		default:
+			return h.Errf("on_exhausted must be 'commit' or 'error', got '%s'", args[0])
+		}
+		plan.OnExhausted = args[0]
+
+	case "request_body_buffer", "response_body_buffer":
+		if len(args) != 1 {
+			return h.ArgErr()
+		}
+		size, err := humanize.ParseBytes(args[0])
+		if err != nil {
+			return h.Errf("'%s' must be a byte size (e.g. 1MB), got '%s': %v", option, args[0], err)
+		}
+		if option == "request_body_buffer" {
+			plan.RequestBodyBuffer = int64(size)
+		} else {
+			plan.ResponseBodyBuffer = int64(size)
+		}
+
+	default:
+		return h.Errf("unrecognized try_handle option '%s': only handle blocks, matcher definitions and fallback plan options are allowed", option)
+	}
+
+	return nil
+}
+
+// parseFallbackStatusCodes parses exact status codes and class codes
+// (e.g. 5xx or 5) from Caddyfile tokens.
+func parseFallbackStatusCodes(h Helper, args []string) ([]int, error) {
+	if len(args) == 0 {
+		return nil, h.ArgErr()
+	}
+	codes := make([]int, 0, len(args))
+	for _, arg := range args {
+		if len(arg) == 3 && strings.HasSuffix(arg, "xx") {
+			arg = arg[:1]
+		}
+		code, err := strconv.Atoi(arg)
+		if err != nil {
+			return nil, h.Errf("bad status value '%s': %v", arg, err)
+		}
+		codes = append(codes, code)
+	}
+	return codes, nil
 }
 
 // parseInvoke parses the invoke directive.

@@ -85,6 +85,7 @@ var defaultDirectiveOrder = []string{
 	"handle",
 	"handle_path",
 	"route",
+	"try_handle",
 
 	// handlers that typically respond to requests
 	"abort",

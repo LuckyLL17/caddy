@@ -484,6 +484,42 @@ func TestReplacerNewWithoutFile(t *testing.T) {
 	}
 }
 
+func TestReplacerSnapshotRestore(t *testing.T) {
+	rep := NewReplacer()
+	rep.Set("keep", "a")
+	rep.Set("overwritten", "original")
+
+	snap := rep.Snapshot()
+
+	rep.Set("overwritten", "changed")
+	rep.Set("added", "b")
+
+	// the snapshot is an independent copy and must not alias the live table
+	snap["snapshot-only"] = "c"
+	if _, ok := rep.Get("snapshot-only"); ok {
+		t.Error("expected mutation of the snapshot to not affect the live replacer")
+	}
+
+	if val, _ := rep.GetString("overwritten"); val != "changed" {
+		t.Errorf("expected 'changed' before restore, got %q", val)
+	}
+	if _, ok := rep.Get("added"); !ok {
+		t.Error("expected 'added' to be set before restore")
+	}
+
+	rep.Restore(snap)
+
+	if val, _ := rep.GetString("keep"); val != "a" {
+		t.Errorf("expected 'keep' to survive restore, got %q", val)
+	}
+	if val, _ := rep.GetString("overwritten"); val != "original" {
+		t.Errorf("expected 'overwritten' to roll back to 'original', got %q", val)
+	}
+	if _, ok := rep.Get("added"); ok {
+		t.Error("expected 'added' to be gone after restore")
+	}
+}
+
 func BenchmarkReplacer(b *testing.B) {
 	type testCase struct {
 		name, input, empty string
