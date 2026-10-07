@@ -25,6 +25,20 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("request_body", parseCaddyfile)
 }
 
+// parseCaddyfile parses the request_body directive. Syntax:
+//
+//	request_body {
+//	    max_size <size>
+//	    set <body>
+//	    replay {
+//	        max_size <size>
+//	        memory <size>
+//	        spill_dir <path>
+//	        allow <scope...>
+//	        on_exceed <reject|degrade>
+//	        on_cancel <delete|retain>
+//	    }
+//	}
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	h.Next() // consume directive name
 
@@ -50,10 +64,100 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				return nil, h.ArgErr()
 			}
 			rb.Set = setStr
+
+		case "replay":
+			if rb.Replay == nil {
+				rb.Replay = new(caddyhttp.BodyReplayConfig)
+			}
+			if err := parseReplayCaddyfile(h, rb.Replay); err != nil {
+				return nil, err
+			}
+
 		default:
 			return nil, h.Errf("unrecognized request_body subdirective '%s'", h.Val())
 		}
 	}
 
 	return rb, nil
+}
+
+// parseReplayCaddyfile parses the replay block. The dispenser is
+// positioned on the "replay" token.
+func parseReplayCaddyfile(h httpcaddyfile.Helper, replay *caddyhttp.BodyReplayConfig) error {
+	for nesting := h.Nesting(); h.NextBlock(nesting); {
+		switch h.Val() {
+		case "max_size":
+			var sizeStr string
+			if !h.AllArgs(&sizeStr) {
+				return h.ArgErr()
+			}
+			size, err := humanize.ParseBytes(sizeStr)
+			if err != nil {
+				return h.Errf("parsing replay max_size: %v", err)
+			}
+			replay.MaxSize = int64(size)
+
+		case "memory", "memory_max_size":
+			var sizeStr string
+			if !h.AllArgs(&sizeStr) {
+				return h.ArgErr()
+			}
+			size, err := humanize.ParseBytes(sizeStr)
+			if err != nil {
+				return h.Errf("parsing replay memory: %v", err)
+			}
+			replay.MemoryMaxSize = int64(size)
+
+		case "spill_dir":
+			var dir string
+			if !h.AllArgs(&dir) {
+				return h.ArgErr()
+			}
+			replay.SpillDir = dir
+
+		case "allow":
+			scopes := h.RemainingArgs()
+			if len(scopes) == 0 {
+				return h.ArgErr()
+			}
+			for _, name := range scopes {
+				if _, ok := caddyhttp.ParseBodyReplayScope(name); !ok {
+					return h.Errf("unknown replay scope %q; expected one of %q, %q, %q",
+						name,
+						caddyhttp.BodyReplayScopeNestedRoutesName,
+						caddyhttp.BodyReplayScopeErrorRoutesName,
+						caddyhttp.BodyReplayScopeRetriesName)
+				}
+			}
+			replay.Allow = append(replay.Allow, scopes...)
+
+		case "on_exceed":
+			var mode string
+			if !h.AllArgs(&mode) {
+				return h.ArgErr()
+			}
+			switch mode {
+			case "reject", "degrade":
+				replay.OnExceed = mode
+			default:
+				return h.Errf("unknown on_exceed %q; expected reject or degrade", mode)
+			}
+
+		case "on_cancel":
+			var mode string
+			if !h.AllArgs(&mode) {
+				return h.ArgErr()
+			}
+			switch mode {
+			case "delete", "retain":
+				replay.OnCancel = mode
+			default:
+				return h.Errf("unknown on_cancel %q; expected delete or retain", mode)
+			}
+
+		default:
+			return h.Errf("unrecognized replay subdirective '%s'", h.Val())
+		}
+	}
+	return nil
 }

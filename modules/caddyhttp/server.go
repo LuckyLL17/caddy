@@ -736,6 +736,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// add HTTP error information to request context
 	r = s.Errors.WithError(r, err)
 
+	// if a request_body replay policy permits it, present the error
+	// routes with a fresh reader over the spooled body; without a
+	// policy this is a no-op and the consumed one-shot body is left as-is
+	r = PrepareBodyReplay(r, BodyReplayScopeErrorRoutes)
+
 	var fields []zapcore.Field
 	if s.Errors != nil && len(s.Errors.Routes) > 0 {
 		// execute user-defined error handling route

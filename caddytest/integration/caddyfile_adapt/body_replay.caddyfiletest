@@ -1,0 +1,63 @@
+localhost
+
+request_body {
+	max_size 10MB
+	replay {
+		max_size 5MB
+		memory 1MB
+		spill_dir /var/tmp/caddy
+		allow error_routes retries
+		on_exceed degrade
+	}
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":443"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"localhost"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"handler": "request_body",
+													"max_size": 10000000,
+													"replay": {
+														"allow": [
+															"error_routes",
+															"retries"
+														],
+														"max_size": 5000000,
+														"memory_max_size": 1000000,
+														"on_exceed": "degrade",
+														"spill_dir": "/var/tmp/caddy"
+													}
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		}
+	}
+}

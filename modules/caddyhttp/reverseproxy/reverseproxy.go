@@ -677,6 +677,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				bufferedReqBody.Reset()
 				bufPool.Put(bufferedReqBody)
 			}()
+		} else if caddyhttp.BodyReplayAllows(r, caddyhttp.BodyReplayScopeRetries) {
+			// a request_body replay policy owns the spool's lifetime,
+			// so a transport Close after a consumed attempt must not
+			// tear the body down before a retry can replay it
+			clonedReq.Body = io.NopCloser(clonedReq.Body)
 		} else {
 			clonedReq.Body = &bodyNopCloserIfNotRead{ReadCloser: clonedReq.Body}
 		}
@@ -704,8 +709,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			clonedReq.Body = io.NopCloser(bytes.NewReader(bufferedReqBody.Bytes()))
 		}
 
+		// if a request_body replay policy permits retries, present
+		// this retry candidate with a fresh reader over the spooled
+		// body; bodies that were not read to completion end the
+		// attempt with ErrBodyReplayIncomplete instead of sending a
+		// silently truncated body
+		replayScopeEntered := false
+		if retries > 0 && caddyhttp.BodyReplayAllows(r, caddyhttp.BodyReplayScopeRetries) {
+			r = caddyhttp.PrepareBodyReplay(r, caddyhttp.BodyReplayScopeRetries)
+			clonedReq.Body = io.NopCloser(r.Body)
+			replayScopeEntered = true
+		}
+
 		var done bool
 		done, proxyErr = h.proxyLoopIteration(clonedReq, r, w, proxyErr, start, retries, repl, reqHeader, reqHost, requestWasIncremental, next)
+		if replayScopeEntered {
+			caddyhttp.LeaveBodyReplayScope(r)
+		}
 		if done {
 			break
 		}

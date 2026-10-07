@@ -785,3 +785,84 @@ func TestSubrouteErrorFallbackWithBody(t *testing.T) {
 		t.Errorf("body: got %q, want %q", rec.Body.String(), expectedBody)
 	}
 }
+
+// TestResponseRetryWithBodyReplayPolicy verifies that when the first
+// upstream fully consumes the body and then answers with a retryable
+// status, a request_body replay policy allowing retries presents the
+// next upstream with the identical body, including a body large enough
+// to have spilled past the memory cap onto disk.
+func TestResponseRetryWithBodyReplayPolicy(t *testing.T) {
+	requestBody := "replay-me-" + strings.Repeat("abcdefgh", 600) // ~4.8 KiB
+
+	var badReads atomic.Int64
+	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("bad upstream read: %v", err)
+		}
+		badReads.Add(1)
+		if string(body) != requestBody {
+			t.Errorf("bad upstream got %d bytes, want %d", len(body), len(requestBody))
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(badServer.Close)
+
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(goodServer.Close)
+
+	retryMatch := caddyhttp.MatcherSets{
+		caddyhttp.MatcherSet{
+			newExpressionMatcher(t, "{http.reverse_proxy.status_code} == 503"),
+		},
+	}
+
+	// RoundRobin picks index 1 first, then 0
+	upstreams := []*Upstream{
+		{Host: new(Host), Dial: goodServer.Listener.Addr().String()},
+		{Host: new(Host), Dial: badServer.Listener.Addr().String()},
+	}
+	h := minimalHandlerWithRetryMatch(1, retryMatch, upstreams...)
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/", strings.NewReader(requestBody))
+	req = prepareTestRequest(req)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	t.Cleanup(cancel)
+
+	cfg := &caddyhttp.BodyReplayConfig{
+		MemoryMaxSize: 64,
+		MaxSize:       1 << 20,
+		SpillDir:      t.TempDir(),
+		Allow:         []string{caddyhttp.BodyReplayScopeRetriesName},
+	}
+	if err := cfg.Provision(caddy.Context{}); err != nil {
+		t.Fatal(err)
+	}
+	req = caddyhttp.EnableBodyReplay(req, cfg, zap.NewNop())
+
+	rec := httptest.NewRecorder()
+	err := h.ServeHTTP(rec, req, caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error {
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("proxy failed: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if badReads.Load() != 1 {
+		t.Errorf("bad upstream was hit %d times, want 1", badReads.Load())
+	}
+	if rec.Body.String() != requestBody {
+		t.Errorf("replayed body length = %d, want %d", rec.Body.Len(), len(requestBody))
+	}
+}

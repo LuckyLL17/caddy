@@ -61,6 +61,11 @@ func init() {
 // ------------|---------------
 // `{http.request.body}` | The request body (⚠️ inefficient; use only for debugging); if reading it exceeds a `request_body` `max_size` limit, templates and the `vars` and `vars_regexp` matchers fail the request with HTTP 413 instead of silently returning a truncated body
 // `{http.request.body_base64}` | The request body, base64-encoded (⚠️ for debugging); same 413 behavior on `max_size` limits as `{http.request.body}` in templates and the `vars` matchers
+// `{http.request.body.replay.spooled_bytes}` | Bytes of the request body currently spooled by an active `request_body` `replay` policy; `0` when no policy is configured
+// `{http.request.body.replay.in_memory}` | Whether the spooled body is still entirely in memory
+// `{http.request.body.replay.spilled}` | Whether the spooled body has overflowed to a disk file
+// `{http.request.body.replay.complete}` | Whether the request body has been read to completion
+// `{http.request.body.replay.degraded}` | Whether the replay cap was exceeded in `degrade` mode (the body keeps streaming but can no longer be replayed)
 // `{http.request.cookie.*}` | HTTP request cookie
 // `{http.request.duration}` | Time up to now spent handling the request (after decoding headers from client)
 // `{http.request.duration_ms}` | Same as 'duration', but in milliseconds.

@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
@@ -37,6 +39,13 @@ type RequestBody struct {
 	// This field permit to replace body on the fly
 	// EXPERIMENTAL. Subject to change/removal.
 	Set string `json:"set,omitempty"`
+
+	// Replay optionally spools the request body so it can be read
+	// more than once within bounded memory and disk usage. Without it,
+	// the body keeps its default one-shot streaming behavior.
+	Replay *caddyhttp.BodyReplayConfig `json:"replay,omitempty"`
+
+	logger *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -45,6 +54,17 @@ func (RequestBody) CaddyModule() caddy.ModuleInfo {
 		ID:  "http.handlers.request_body",
 		New: func() caddy.Module { return new(RequestBody) },
 	}
+}
+
+// Provision sets up the body replay policy, if configured.
+func (rb *RequestBody) Provision(ctx caddy.Context) error {
+	rb.logger = ctx.Logger()
+	if rb.Replay != nil {
+		if err := rb.Replay.Provision(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (rb RequestBody) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -66,6 +86,12 @@ func (rb RequestBody) ServeHTTP(w http.ResponseWriter, r *http.Request, next cad
 	if r.Body == nil {
 		return next.ServeHTTP(w, r)
 	}
+	// Spool for replay inside the configured scopes. This stays a
+	// streaming read: bytes are only retained as they are consumed, up
+	// to the configured limits, and never buffered eagerly.
+	if rb.Replay != nil {
+		r = caddyhttp.EnableBodyReplay(r, rb.Replay, rb.logger)
+	}
 	if rb.MaxSize > 0 {
 		r.Body = errorWrapper{http.MaxBytesReader(w, r.Body, rb.MaxSize)}
 	}
@@ -86,5 +112,8 @@ func (ew errorWrapper) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Interface guard
-var _ caddyhttp.MiddlewareHandler = (*RequestBody)(nil)
+// Interface guards
+var (
+	_ caddyhttp.MiddlewareHandler = (*RequestBody)(nil)
+	_ caddy.Provisioner           = (*RequestBody)(nil)
+)

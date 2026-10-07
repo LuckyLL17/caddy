@@ -73,6 +73,11 @@ func (sr *Subroute) ServeHTTP(w http.ResponseWriter, r *http.Request, next Handl
 	subroute := sr.Routes.Compile(next)
 	err := subroute.ServeHTTP(w, r)
 	if err != nil && sr.Errors != nil {
+		// present the subroute's error routes with a fresh reader
+		// over the spooled body when a replay policy allows it;
+		// without a policy this is a no-op
+		r = PrepareBodyReplay(r, BodyReplayScopeErrorRoutes)
+		defer LeaveBodyReplayScope(r)
 		r = sr.Errors.WithError(r, err)
 		errRoute := sr.Errors.Routes.Compile(next)
 		return errRoute.ServeHTTP(w, r)

@@ -249,6 +249,20 @@ func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.Respo
 				}
 				return base64.StdEncoding.EncodeToString(body), true
 
+			// state of the optional request_body body replay policy;
+			// these are known even when no policy is configured, so
+			// they evaluate to zero values instead of the raw key
+			case "http.request.body.replay.spooled_bytes":
+				return bodyReplayStats(req).spooled, true
+			case "http.request.body.replay.in_memory":
+				return bodyReplayStats(req).inMemory, true
+			case "http.request.body.replay.spilled":
+				return bodyReplayStats(req).spilled, true
+			case "http.request.body.replay.complete":
+				return bodyReplayStats(req).complete, true
+			case "http.request.body.replay.degraded":
+				return bodyReplayStats(req).degraded, true
+
 			// original request, before any internal changes
 			case "http.request.orig_method":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
@@ -443,6 +457,13 @@ func (e RequestBodyLimitError) Unwrap() error { return e.Err }
 // before, because the request is probably not going to be served normally
 // anyway and we want to keep the placeholder's behavior unchanged in that case.
 func readRequestBodyForPlaceholder(req *http.Request) ([]byte, error) {
+	// With an active replay policy, drain through the spool without
+	// closing the live body and replace it with an independent replay
+	// reader, so later handlers can consume the same body again.
+	if state := getBodyReplay(req.Context()); state != nil && bodyReplayReadable(req.Context()) {
+		return state.readAllForPlaceholder(req)
+	}
+
 	// normally net/http will close the body for us, but since we are replacing
 	// it with a fake one, we have to ensure we close the real body ourselves
 	defer req.Body.Close()
