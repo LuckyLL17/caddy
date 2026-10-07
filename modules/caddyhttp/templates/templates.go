@@ -389,8 +389,13 @@ type Templates struct {
 	// act as components on web pages, for example.
 	ExtensionsRaw caddy.ModuleMap `json:"match,omitempty" caddy:"namespace=http.handlers.templates.functions"`
 
-	customFuncs []template.FuncMap
-	logger      *zap.Logger
+	// IncludeGraph optionally limits and caches template include graphs.
+	IncludeGraph *IncludeGraphPolicy `json:"include_graph,omitempty"`
+
+	customFuncs   []template.FuncMap
+	funcVersion   string
+	templateCache *templateCache
+	logger        *zap.Logger
 }
 
 // CustomFunctions is the interface for registering custom template functions.
@@ -417,6 +422,13 @@ func (t *Templates) Provision(ctx caddy.Context) error {
 	for _, modIface := range mods.(map[string]any) {
 		t.customFuncs = append(t.customFuncs, modIface.(CustomFunctions).CustomTemplateFunctions())
 	}
+	t.funcVersion = templateFunctionsVersion(t.customFuncs)
+	if t.IncludeGraph != nil {
+		t.templateCache, err = t.IncludeGraph.provision(t.funcVersion)
+		if err != nil {
+			return err
+		}
+	}
 
 	if t.MIMETypes == nil {
 		t.MIMETypes = defaultMIMETypes
@@ -431,6 +443,17 @@ func (t *Templates) Provision(ctx caddy.Context) error {
 func (t *Templates) Validate() error {
 	if len(t.Delimiters) != 0 && len(t.Delimiters) != 2 {
 		return fmt.Errorf("delimiters must consist of exactly two elements: opening and closing")
+	}
+	if t.IncludeGraph != nil {
+		return t.IncludeGraph.validate()
+	}
+	return nil
+}
+
+// Cleanup discards compiled templates owned by this middleware instance.
+func (t *Templates) Cleanup() error {
+	if t.templateCache != nil {
+		t.templateCache.close()
 	}
 	return nil
 }
@@ -466,6 +489,9 @@ func (t *Templates) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if err != nil {
 		return err
 	}
+	if t.IncludeGraph != nil && r.Header.Get(recursionPreventionHeader) != "" {
+		rec.Header().Set(templatesRenderedHeader, "1")
+	}
 
 	rec.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	rec.Header().Del("Accept-Ranges") // we don't know ranges for dynamically-created content
@@ -487,12 +513,21 @@ func (t *Templates) executeTemplate(rr caddyhttp.ResponseRecorder, r *http.Reque
 		fs = http.Dir(repl.ReplaceAll(t.FileRoot, "."))
 	}
 
+	var state *templateRenderState
+	if t.IncludeGraph != nil {
+		state, _ = r.Context().Value(renderStateContextKey).(*templateRenderState)
+		if state == nil {
+			state = newTemplateRenderState()
+		}
+	}
+
 	ctx := &TemplateContext{
 		Root:        fs,
 		Req:         r,
 		RespHeader:  WrappedHeader{rr.Header()},
 		config:      t,
 		CustomFuncs: t.customFuncs,
+		state:       state,
 	}
 
 	err := ctx.executeTemplateInBuffer(r.URL.Path, rr.Buffer())
@@ -511,9 +546,11 @@ func (t *Templates) executeTemplate(rr caddyhttp.ResponseRecorder, r *http.Reque
 // virtualResponseWriter is used in virtualized HTTP requests
 // that templates may execute.
 type virtualResponseWriter struct {
-	status int
-	header http.Header
-	body   *bytes.Buffer
+	status   int
+	header   http.Header
+	body     *bytes.Buffer
+	onWrite  func(int) error
+	writeErr error
 }
 
 func (vrw *virtualResponseWriter) Header() http.Header {
@@ -525,7 +562,17 @@ func (vrw *virtualResponseWriter) WriteHeader(statusCode int) {
 }
 
 func (vrw *virtualResponseWriter) Write(data []byte) (int, error) {
-	return vrw.body.Write(data)
+	if vrw.onWrite != nil {
+		if err := vrw.onWrite(len(data)); err != nil {
+			vrw.writeErr = err
+			return 0, err
+		}
+	}
+	n, err := vrw.body.Write(data)
+	if err != nil {
+		vrw.writeErr = err
+	}
+	return n, err
 }
 
 var defaultMIMETypes = []string{
@@ -538,5 +585,6 @@ var defaultMIMETypes = []string{
 var (
 	_ caddy.Provisioner           = (*Templates)(nil)
 	_ caddy.Validator             = (*Templates)(nil)
+	_ caddy.CleanerUpper          = (*Templates)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Templates)(nil)
 )

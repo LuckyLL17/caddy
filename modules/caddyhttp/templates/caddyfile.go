@@ -15,6 +15,11 @@
 package templates
 
 import (
+	"strconv"
+	"time"
+
+	"github.com/dustin/go-humanize"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -32,10 +37,21 @@ func init() {
 //	    mime <types...>
 //	    between <open_delim> <close_delim>
 //	    root <path>
+//	    include_graph {
+//	        compiled_cache <true|false>
+//	        cache_capacity <entries>
+//	        max_file_size <size>
+//	        max_include_depth <depth>
+//	        max_expansion_bytes <size>
+//	        file_change_check <duration>
+//	        cache_ttl <duration>
+//	        eviction_policy <lru|random>
+//	    }
 //	}
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	h.Next() // consume directive name
 	t := new(Templates)
+	var err error
 	for h.NextBlock(0) {
 		switch h.Val() {
 		case "mime":
@@ -52,6 +68,99 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			if !h.Args(&t.FileRoot) {
 				return nil, h.ArgErr()
 			}
+		case "include_graph":
+			if t.IncludeGraph != nil {
+				return nil, h.Err("include_graph already specified")
+			}
+			if h.NextArg() {
+				return nil, h.ArgErr()
+			}
+			policy := new(IncludeGraphPolicy)
+			for nesting := h.Nesting(); h.NextBlock(nesting); {
+				switch h.Val() {
+				case "compiled_cache":
+					args := h.RemainingArgs()
+					if len(args) > 1 {
+						return nil, h.ArgErr()
+					}
+					enabled := true
+					if len(args) == 1 {
+						enabled, err = strconv.ParseBool(args[0])
+						if err != nil {
+							return nil, h.Errf("parsing compiled_cache: %v", err)
+						}
+					}
+					policy.CompiledCache = &enabled
+				case "cache_capacity":
+					args := h.RemainingArgs()
+					if len(args) != 1 {
+						return nil, h.ArgErr()
+					}
+					policy.CacheCapacity, err = strconv.ParseInt(args[0], 10, 64)
+					if err != nil {
+						return nil, h.Errf("parsing cache_capacity: %v", err)
+					}
+				case "max_file_size":
+					args := h.RemainingArgs()
+					if len(args) != 1 {
+						return nil, h.ArgErr()
+					}
+					policy.MaxFileSize, err = parseCaddyfileSize(args[0])
+					if err != nil {
+						return nil, h.Errf("parsing max_file_size: %v", err)
+					}
+				case "max_include_depth":
+					args := h.RemainingArgs()
+					if len(args) != 1 {
+						return nil, h.ArgErr()
+					}
+					policy.MaxIncludeDepth, err = strconv.Atoi(args[0])
+					if err != nil {
+						return nil, h.Errf("parsing max_include_depth: %v", err)
+					}
+				case "max_expansion_bytes":
+					args := h.RemainingArgs()
+					if len(args) != 1 {
+						return nil, h.ArgErr()
+					}
+					policy.MaxExpansionBytes, err = parseCaddyfileSize(args[0])
+					if err != nil {
+						return nil, h.Errf("parsing max_expansion_bytes: %v", err)
+					}
+				case "file_change_check":
+					args := h.RemainingArgs()
+					if len(args) != 1 {
+						return nil, h.ArgErr()
+					}
+					var duration time.Duration
+					if args[0] != "-1" {
+						duration, err = caddy.ParseDuration(args[0])
+						if err != nil {
+							return nil, h.Errf("parsing file_change_check: %v", err)
+						}
+					} else {
+						duration = -1
+					}
+					policy.FileChangeCheck = caddy.Duration(duration)
+				case "cache_ttl":
+					args := h.RemainingArgs()
+					if len(args) != 1 {
+						return nil, h.ArgErr()
+					}
+					duration, err := caddy.ParseDuration(args[0])
+					if err != nil {
+						return nil, h.Errf("parsing cache_ttl: %v", err)
+					}
+					policy.CacheTTL = caddy.Duration(duration)
+				case "eviction_policy":
+					if !h.Args(&policy.EvictionPolicy) {
+						return nil, h.ArgErr()
+					}
+				default:
+					return nil, h.Errf("unrecognized include_graph subdirective: %s", h.Val())
+				}
+			}
+			t.IncludeGraph = policy
 		case "extensions":
 			if h.NextArg() {
 				return nil, h.ArgErr()
@@ -78,4 +187,18 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 		}
 	}
 	return t, nil
+}
+
+func parseCaddyfileSize(value string) (int64, error) {
+	if value == "-1" {
+		return -1, nil
+	}
+	size, err := humanize.ParseBytes(value)
+	if err != nil {
+		return 0, err
+	}
+	if size > 1<<63-1 {
+		return 0, strconv.ErrRange
+	}
+	return int64(size), nil
 }

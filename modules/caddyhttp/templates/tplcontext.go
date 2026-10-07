@@ -16,6 +16,7 @@ package templates
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"text/template/parse"
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
@@ -56,6 +58,7 @@ type TemplateContext struct {
 
 	config *Templates
 	tpl    *template.Template
+	state  *templateRenderState
 }
 
 // NewTemplate returns a new template intended to be evaluated with this
@@ -77,7 +80,12 @@ func (c *TemplateContext) NewTemplate(tplName string) *template.Template {
 	}
 
 	// add our own library
-	c.tpl.Funcs(template.FuncMap{
+	c.tpl.Funcs(c.coreTemplateFuncs())
+	return c.tpl
+}
+
+func (c *TemplateContext) coreTemplateFuncs() template.FuncMap {
+	return template.FuncMap{
 		"include":          c.funcInclude,
 		"readFile":         c.funcReadFile,
 		"import":           c.funcImport,
@@ -89,14 +97,13 @@ func (c *TemplateContext) NewTemplate(tplName string) *template.Template {
 		"fileStat":         c.funcFileStat,
 		"env":              c.funcEnv,
 		"placeholder":      c.funcPlaceholder,
-		"ph":               c.funcPlaceholder, // shortcut
+		"ph":               c.funcPlaceholder,
 		"fileExists":       c.funcFileExists,
 		"httpError":        c.funcHTTPError,
 		"humanize":         c.funcHumanize,
 		"maybe":            c.funcMaybe,
 		"pathEscape":       url.PathEscape,
-	})
-	return c.tpl
+	}
 }
 
 // OriginalReq returns the original, unmodified, un-rewritten request as
@@ -110,7 +117,11 @@ func (c TemplateContext) OriginalReq() http.Request {
 // Note that included files are NOT escaped, so you should only include
 // trusted files. If it is not trusted, be sure to use escaping functions
 // in your template.
-func (c TemplateContext) funcInclude(filename string, args ...any) (string, error) {
+func (c *TemplateContext) funcInclude(filename string, args ...any) (string, error) {
+	if c.policy() != nil {
+		return c.includeManaged(filename, args...)
+	}
+
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
@@ -134,7 +145,11 @@ func (c TemplateContext) funcInclude(filename string, args ...any) (string, erro
 // Note that included files are NOT escaped, so you should only include
 // trusted files. If it is not trusted, be sure to use escaping functions
 // in your template.
-func (c TemplateContext) funcReadFile(filename string) (string, error) {
+func (c *TemplateContext) funcReadFile(filename string) (string, error) {
+	if c.policy() != nil {
+		return c.readFileManaged(filename)
+	}
+
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
@@ -171,7 +186,11 @@ func (c TemplateContext) readFileToBuffer(filename string, bodyBuf *bytes.Buffer
 // to the given URI on the same server. Note that included bodies
 // are NOT escaped, so you should only include trusted resources.
 // If it is not trusted, be sure to use escaping functions yourself.
-func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
+func (c *TemplateContext) funcHTTPInclude(uri string) (string, error) {
+	if c.policy() != nil {
+		return c.httpIncludeManaged(uri)
+	}
+
 	// prevent virtual request loops by counting how many levels
 	// deep we are; and if we get too deep, return an error
 	recursionCount := 1
@@ -222,6 +241,10 @@ func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
 // {{ template }} from the standard template library. If the imported file has
 // no {{ define }} blocks, the name of the import will be the path
 func (c *TemplateContext) funcImport(filename string) (string, error) {
+	if c.policy() != nil {
+		return c.importManaged(filename)
+	}
+
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
@@ -239,6 +262,10 @@ func (c *TemplateContext) funcImport(filename string) (string, error) {
 }
 
 func (c *TemplateContext) executeTemplateInBuffer(tplName string, buf *bytes.Buffer) error {
+	if c.policy() != nil {
+		return c.executeManagedTemplateInBuffer(tplName, buf)
+	}
+
 	c.NewTemplate(tplName)
 
 	_, err := c.tpl.Parse(buf.String())
@@ -249,6 +276,476 @@ func (c *TemplateContext) executeTemplateInBuffer(tplName string, buf *bytes.Buf
 	buf.Reset() // reuse buffer for output
 
 	return c.tpl.Execute(buf, c)
+}
+
+type managedTemplateFile struct {
+	rootKey string
+	path    string
+	content string
+	info    fs.FileInfo
+}
+
+func (c *TemplateContext) policy() *IncludeGraphPolicy {
+	if c.config == nil {
+		return nil
+	}
+	return c.config.IncludeGraph
+}
+
+func (c *TemplateContext) ensureRenderState() *templateRenderState {
+	if c.state == nil {
+		c.state = newTemplateRenderState()
+	}
+	return c.state
+}
+
+func (c *TemplateContext) requestContextErr() error {
+	if c.Req == nil || c.Req.Context() == nil {
+		return nil
+	}
+	return c.Req.Context().Err()
+}
+
+func (c *TemplateContext) templateDelimiters() (string, string) {
+	if c.config != nil && len(c.config.Delimiters) == 2 {
+		return c.config.Delimiters[0], c.config.Delimiters[1]
+	}
+	return "{{", "}}"
+}
+
+func (c *TemplateContext) managedTemplateLocation(filename string) (string, string, error) {
+	if c.Root == nil {
+		return "", "", fmt.Errorf("root file system not specified")
+	}
+	return rootFileSystemKey(c.Root), cleanTemplatePath(filename), nil
+}
+
+func (c *TemplateContext) openManagedTemplateFile(rootKey, filename string) (http.File, fs.FileInfo, error) {
+	if err := c.requestContextErr(); err != nil {
+		return nil, nil, err
+	}
+	file, err := c.Root.Open(filename)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if info.IsDir() {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("%s is a directory", filename)
+	}
+	if maxFileSize := c.policy().MaxFileSize; maxFileSize >= 0 && info.Size() > maxFileSize {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("%w: %s", errMaxFileSize, filename)
+	}
+	return file, info, nil
+}
+
+func (c *TemplateContext) readManagedTemplateFile(file http.File, filename string) (string, error) {
+	reader := io.Reader(file)
+	maxFileSize := c.policy().MaxFileSize
+	if maxFileSize >= 0 {
+		reader = io.LimitReader(file, maxFileSize+1)
+	}
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	if maxFileSize >= 0 && int64(len(content)) > maxFileSize {
+		return "", fmt.Errorf("%w: %s", errMaxFileSize, filename)
+	}
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+	return string(content), nil
+}
+
+func (c *TemplateContext) loadManagedTemplateFile(rootKey, filename string) (managedTemplateFile, error) {
+	file, info, err := c.openManagedTemplateFile(rootKey, filename)
+	if err != nil {
+		return managedTemplateFile{}, err
+	}
+	defer file.Close()
+	content, err := c.readManagedTemplateFile(file, filename)
+	if err != nil {
+		return managedTemplateFile{}, err
+	}
+	return managedTemplateFile{rootKey: rootKey, path: filename, content: content, info: info}, nil
+}
+
+func (c *TemplateContext) cacheKey(rootKey, filename string, info fs.FileInfo) templateCacheKey {
+	leftDelim, rightDelim := c.templateDelimiters()
+	return templateCacheKey{
+		root:        rootKey,
+		path:        filename,
+		delimiters:  leftDelim + "\x00" + rightDelim,
+		funcVersion: c.config.funcVersion,
+		size:        info.Size(),
+		mode:        info.Mode(),
+		modTime:     info.ModTime(),
+	}
+}
+
+func (c *TemplateContext) cacheKeyFor(file managedTemplateFile) templateCacheKey {
+	return c.cacheKey(file.rootKey, file.path, file.info)
+}
+
+func (c *TemplateContext) parseManagedTemplate(name, content string) (map[string]*parse.Tree, error) {
+	leftDelim, rightDelim := c.templateDelimiters()
+	funcMaps := []map[string]any{c.coreTemplateFuncs(), sprigFuncMap}
+	for _, funcMap := range c.CustomFuncs {
+		funcMaps = append(funcMaps, funcMap)
+	}
+	return parse.Parse(name, content, leftDelim, rightDelim, funcMaps...)
+}
+
+func addParsedTemplateTrees(tpl *template.Template, trees map[string]*parse.Tree, sourceRoot, targetRoot string) error {
+	for name, tree := range trees {
+		copied := tree.Copy()
+		targetName := name
+		if name == sourceRoot {
+			targetName = targetRoot
+			copied.Name = targetRoot
+			copied.ParseName = targetRoot
+		}
+		if _, err := tpl.AddParseTree(targetName, copied); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *TemplateContext) validateImportGraph(rootKey string, trees map[string]*parse.Tree, stack []string) error {
+	for target := range staticTemplateImports(trees) {
+		targetPath := cleanTemplatePath(target)
+		targetKey := "file:" + rootKey + ":" + targetPath
+		for _, active := range stack {
+			if active == targetKey {
+				return errIncludeCycle
+			}
+		}
+		targetDepth := c.state.currentDepth() + len(stack) + 1
+		if targetDepth > c.policy().MaxIncludeDepth {
+			return errMaxIncludeDepth
+		}
+		if validatedDepth, ok := c.state.importValidationDepth(targetKey); ok && targetDepth <= validatedDepth {
+			continue
+		}
+		importedTrees, err := c.managedTemplateTrees(rootKey, targetPath)
+		if err != nil {
+			return err
+		}
+		if err := c.validateImportGraph(rootKey, importedTrees, append(stack, targetKey)); err != nil {
+			return err
+		}
+		c.state.markImportValidated(targetKey, targetDepth)
+	}
+	return nil
+}
+
+func staticTemplateImports(trees map[string]*parse.Tree) map[string]struct{} {
+	imports := make(map[string]struct{})
+	for _, tree := range trees {
+		walkTemplateImports(tree.Root, imports)
+	}
+	return imports
+}
+
+func walkTemplateImports(node parse.Node, imports map[string]struct{}) {
+	switch node := node.(type) {
+	case *parse.ListNode:
+		for _, child := range node.Nodes {
+			walkTemplateImports(child, imports)
+		}
+	case *parse.ActionNode:
+		walkTemplateImportPipe(node.Pipe, imports)
+	case *parse.IfNode:
+		walkTemplateImportPipe(node.Pipe, imports)
+		walkTemplateImports(node.List, imports)
+		walkTemplateImports(node.ElseList, imports)
+	case *parse.RangeNode:
+		walkTemplateImportPipe(node.Pipe, imports)
+		walkTemplateImports(node.List, imports)
+		walkTemplateImports(node.ElseList, imports)
+	case *parse.WithNode:
+		walkTemplateImportPipe(node.Pipe, imports)
+		walkTemplateImports(node.List, imports)
+		walkTemplateImports(node.ElseList, imports)
+	case *parse.TemplateNode:
+		walkTemplateImportPipe(node.Pipe, imports)
+	}
+}
+
+func walkTemplateImportPipe(pipe *parse.PipeNode, imports map[string]struct{}) {
+	if pipe == nil {
+		return
+	}
+	for _, command := range pipe.Cmds {
+		if len(command.Args) < 2 {
+			continue
+		}
+		identifier, ok := command.Args[0].(*parse.IdentifierNode)
+		if !ok || identifier.Ident != "import" {
+			continue
+		}
+		filename, ok := command.Args[1].(*parse.StringNode)
+		if ok {
+			imports[filename.Text] = struct{}{}
+		}
+	}
+}
+
+func (c *TemplateContext) renderManagedTemplate(name string, trees map[string]*parse.Tree) (string, error) {
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+	state := c.ensureRenderState()
+	c.NewTemplate(name)
+	if err := addParsedTemplateTrees(c.tpl, trees, name, name); err != nil {
+		return "", err
+	}
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	writer := &expansionLimitedWriter{
+		buf:               buf,
+		state:             state,
+		limit:             c.policy().MaxExpansionBytes,
+		childBytesAtStart: state.currentChildBytes(),
+	}
+	if err := c.tpl.Execute(writer, c); err != nil {
+		return "", err
+	}
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func (c *TemplateContext) executeManagedTemplateInBuffer(tplName string, buf *bytes.Buffer) error {
+	state := c.ensureRenderState()
+	if err := c.requestContextErr(); err != nil {
+		return err
+	}
+	shouldPromote := !state.hasActiveNodes()
+	popRoot := func() {}
+	if shouldPromote {
+		popRoot = state.pushRoot("response:" + tplName)
+	}
+	defer popRoot()
+
+	trees, err := c.parseManagedTemplate(tplName, buf.String())
+	if err != nil {
+		return err
+	}
+	output, err := c.renderManagedTemplate(tplName, trees)
+	if err != nil {
+		return err
+	}
+	if shouldPromote {
+		state.promotePendingTemplates(c.config.templateCache, time.Now())
+	}
+	buf.Reset()
+	_, err = buf.WriteString(output)
+	return err
+}
+
+func (c *TemplateContext) includeManaged(filename string, args ...any) (string, error) {
+	state := c.ensureRenderState()
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+	rootKey, filePath, err := c.managedTemplateLocation(filename)
+	if err != nil {
+		return "", err
+	}
+	leave, err := state.enter("file:"+rootKey+":"+filePath, c.policy().MaxIncludeDepth)
+	if err != nil {
+		return "", err
+	}
+	defer leave()
+
+	trees, err := c.managedTemplateTrees(rootKey, filePath)
+	if err != nil {
+		return "", err
+	}
+	c.Args = args
+	childBytesBefore := state.currentChildBytes()
+	output, err := c.renderManagedTemplate(filePath, trees)
+	if err != nil {
+		return "", err
+	}
+	childOutput := len(output) - int(state.currentChildBytes()-childBytesBefore)
+	if childOutput > 0 {
+		state.addChildOutput(childOutput)
+	}
+	return output, nil
+}
+
+func (c *TemplateContext) importManaged(filename string) (string, error) {
+	state := c.ensureRenderState()
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+	rootKey, filePath, err := c.managedTemplateLocation(filename)
+	if err != nil {
+		return "", err
+	}
+	nodeKey := "file:" + rootKey + ":" + filePath
+	trees, err := c.managedTemplateTrees(rootKey, filePath)
+	if err != nil {
+		return "", err
+	}
+	rootDepth := state.currentDepth() + 1
+	if rootDepth > c.policy().MaxIncludeDepth {
+		return "", errMaxIncludeDepth
+	}
+	if validatedDepth, ok := state.importValidationDepth(nodeKey); !ok || rootDepth > validatedDepth {
+		if err := c.validateImportGraph(rootKey, trees, []string{nodeKey}); err != nil {
+			return "", err
+		}
+		state.markImportValidated(nodeKey, rootDepth)
+	}
+	if c.tpl == nil {
+		c.NewTemplate(filePath)
+	}
+	return "", addParsedTemplateTrees(c.tpl, trees, filePath, c.tpl.Name())
+}
+
+func (c *TemplateContext) managedTemplateTrees(rootKey, filePath string) (map[string]*parse.Tree, error) {
+	leftDelim, rightDelim := c.templateDelimiters()
+	version := templateCacheVersionKey{
+		root:        rootKey,
+		path:        filePath,
+		delimiters:  leftDelim + "\x00" + rightDelim,
+		funcVersion: c.config.funcVersion,
+	}
+	state := c.ensureRenderState()
+	if c.config.templateCache != nil {
+		if entry, ok := c.config.templateCache.peek(version, time.Now()); ok {
+			return cloneTemplateTrees(entry.trees), nil
+		}
+	}
+	if entry, ok := state.pendingTemplateVersion(version); ok {
+		return cloneTemplateTrees(entry.trees), nil
+	}
+	file, info, err := c.openManagedTemplateFile(rootKey, filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	key := c.cacheKey(rootKey, filePath, info)
+	if c.config.templateCache != nil {
+		if entry, ok := c.config.templateCache.get(key, info, time.Now()); ok {
+			return cloneTemplateTrees(entry.trees), nil
+		}
+	}
+	content, err := c.readManagedTemplateFile(file, filePath)
+	if err != nil {
+		return nil, err
+	}
+	trees, err := c.parseManagedTemplate(filePath, content)
+	if err != nil {
+		return nil, err
+	}
+	state.storePendingTemplate(key, pendingTemplateEntry{
+		rootName: filePath,
+		trees:    cloneTemplateTrees(trees),
+		info:     info,
+	})
+	return trees, nil
+}
+
+func (c *TemplateContext) readFileManaged(filename string) (string, error) {
+	rootKey, filePath, err := c.managedTemplateLocation(filename)
+	if err != nil {
+		return "", err
+	}
+	file, err := c.loadManagedTemplateFile(rootKey, filePath)
+	if err != nil {
+		return "", err
+	}
+	return file.content, nil
+}
+
+func (c *TemplateContext) httpIncludeManaged(uri string) (string, error) {
+	state := c.ensureRenderState()
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+
+	reqCtx := context.WithValue(c.Req.Context(), renderStateContextKey, state)
+	virtReq, err := http.NewRequestWithContext(reqCtx, http.MethodGet, uri, nil)
+	if err != nil {
+		return "", err
+	}
+	leave, err := state.enter("http:"+virtReq.URL.String(), c.policy().MaxIncludeDepth)
+	if err != nil {
+		return "", err
+	}
+	defer leave()
+
+	virtReq.Host = c.Req.Host
+	virtReq.RemoteAddr = "127.0.0.1:10000"
+	virtReq.Header = c.Req.Header.Clone()
+	virtReq.Header.Set("Accept-Encoding", "identity")
+	virtReq.Trailer = c.Req.Trailer.Clone()
+	virtReq.Header.Set(recursionPreventionHeader, strconv.Itoa(state.currentDepth()))
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	vrw := &virtualResponseWriter{body: buf, header: make(http.Header)}
+	server := c.Req.Context().Value(caddyhttp.ServerCtxKey).(http.Handler)
+	startExpanded := state.expandedBytes()
+	childBytesBefore := state.currentChildBytes()
+	var responseBytes int64
+	vrw.onWrite = func(n int) error {
+		if vrw.header.Get(templatesRenderedHeader) == "1" {
+			return nil
+		}
+		limit := c.policy().MaxExpansionBytes
+		if limit >= 0 && state.expandedBytes()+responseBytes+int64(n) > limit {
+			return errMaxExpansionSize
+		}
+		responseBytes += int64(n)
+		return nil
+	}
+
+	server.ServeHTTP(vrw, virtReq)
+	if vrw.writeErr != nil {
+		return "", vrw.writeErr
+	}
+	if err := c.requestContextErr(); err != nil {
+		return "", err
+	}
+	if vrw.status >= http.StatusBadRequest {
+		return "", fmt.Errorf("http %d", vrw.status)
+	}
+
+	output := buf.String()
+	if vrw.header.Get(templatesRenderedHeader) != "1" {
+		state.setExpanded(startExpanded)
+		trees, err := c.parseManagedTemplate(uri, buf.String())
+		if err != nil {
+			return "", err
+		}
+		output, err = c.renderManagedTemplate(uri, trees)
+		if err != nil {
+			return "", err
+		}
+	}
+	childOutput := len(output) - int(state.currentChildBytes()-childBytesBefore)
+	if childOutput > 0 {
+		state.addChildOutput(childOutput)
+	}
+	return output, nil
 }
 
 func (c TemplateContext) funcPlaceholder(name string) (string, error) {
@@ -596,4 +1093,7 @@ var bufPool = sync.Pool{
 // involves iterating the whole map, so do it just once
 var sprigFuncMap = sprig.TxtFuncMap()
 
-const recursionPreventionHeader = "Caddy-Templates-Include"
+const (
+	recursionPreventionHeader = "Caddy-Templates-Include"
+	templatesRenderedHeader   = "Caddy-Templates-Rendered"
+)
