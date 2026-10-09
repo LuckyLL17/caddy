@@ -82,7 +82,20 @@ type ListenerWrapper struct {
 	// Policy definitions are here: https://pkg.go.dev/github.com/pires/go-proxyproto@v0.7.0#Policy
 	FallbackPolicy Policy `json:"fallback_policy,omitempty"`
 
+	// Policy is an optional deterministic per-connection policy that adds
+	// explicit control over accepted PROXY protocol versions, the maximum
+	// header size, v2 TLV accept/discard rules, missing and malformed header
+	// handling, and whether the reported endpoints come from the header or
+	// the socket peer. It is validated and compiled into a read-only form at
+	// provision time; each connection evaluates it with local state only.
+	//
+	// When nil, the wrapper keeps its raw go-proxyproto behavior unchanged.
+	Policy *ConnectionPolicy `json:"policy,omitempty"`
+
 	policy goproxy.ConnPolicyFunc
+
+	// compiled is the immutable compiled form of Policy.
+	compiled *compiledPolicy
 }
 
 // Provision sets up the listener wrapper.
@@ -130,15 +143,40 @@ func (pp *ListenerWrapper) Provision(ctx caddy.Context) error {
 		}
 		return policyToGoProxyPolicy[ret], nil
 	}
+
+	if pp.Policy != nil {
+		compiled, err := pp.Policy.compile()
+		if err != nil {
+			return err
+		}
+		pp.compiled = compiled
+	}
 	return nil
 }
 
 // WrapListener adds PROXY protocol support to the listener.
 func (pp *ListenerWrapper) WrapListener(l net.Listener) net.Listener {
-	pl := &goproxy.Listener{
-		Listener:          l,
-		ReadHeaderTimeout: time.Duration(pp.Timeout),
+	// Without a deterministic policy the wrapper behaves exactly as before:
+	// the raw go-proxyproto listener enforces Allow/Deny, FallbackPolicy and
+	// the header timeout.
+	if pp.compiled == nil {
+		pl := &goproxy.Listener{
+			Listener:          l,
+			ReadHeaderTimeout: time.Duration(pp.Timeout),
+		}
+		pl.ConnPolicy = pp.policy
+		return pl
 	}
-	pl.ConnPolicy = pp.policy
-	return pl
+
+	// Mirror goproxy.Listener.Accept: an unset timeout falls back to the
+	// library default, a negative value disables the header deadline.
+	headerTimeout := time.Duration(pp.Timeout)
+	if headerTimeout == 0 {
+		headerTimeout = goproxy.DefaultReadHeaderTimeout
+	}
+	return &policyListener{
+		Listener:      l,
+		headerTimeout: headerTimeout,
+		w:             pp,
+	}
 }

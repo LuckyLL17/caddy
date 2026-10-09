@@ -37,6 +37,23 @@ func (ListenerWrapper) CaddyModule() caddy.ModuleInfo {
 //		allow <IPs...>
 //		deny <IPs...>
 //		fallback_policy <policy>
+//		policy {
+//			versions <1|2...>
+//			max_header_size <size>
+//			missing <allow|reject>
+//			malformed <allow|reject>
+//			address <header|peer>
+//			address {
+//				remote <header|peer>
+//				local <header|peer>
+//			}
+//			tlv {
+//				default <accept|discard|reject>
+//				accept <types...>
+//				discard <types...>
+//				reject <types...>
+//			}
+//		}
 //	}
 func (w *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume wrapper name
@@ -71,6 +88,18 @@ func (w *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.WrapErr(err)
 			}
 			w.FallbackPolicy = p
+		case "policy":
+			if d.NextArg() {
+				return d.ArgErr()
+			}
+			if w.Policy != nil {
+				return d.Err("proxy_protocol policy block may only be specified once")
+			}
+			policy := new(ConnectionPolicy)
+			if err := policy.unmarshalCaddyfile(d); err != nil {
+				return err
+			}
+			w.Policy = policy
 		default:
 			return d.ArgErr()
 		}

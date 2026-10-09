@@ -53,6 +53,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	goproxy "github.com/pires/go-proxyproto"
 	"golang.org/x/net/http2"
@@ -591,5 +592,130 @@ func TestProxyProtocolListenerWrapper(t *testing.T) {
 
 	if !strings.Contains(raw, "10.0.0.1") {
 		t.Errorf("expected spoofed address 10.0.0.1 in response body; full response:\n%s", raw)
+	}
+}
+
+// TestProxyProtocolListenerWrapperPolicy exercises the optional deterministic
+// policy on the caddy.listeners.proxy_protocol wrapper end to end:
+//
+//   - a v2 header carrying only an accepted ALPN TLV is applied,
+//   - a v1 header is rejected (only version 2 is allowed),
+//   - a missing header is rejected,
+//   - a v2 header carrying a TLV outside the accept list is rejected.
+func TestProxyProtocolListenerWrapperPolicy(t *testing.T) {
+	tester := caddytest.NewTester(t)
+	tester.InitServer(`{
+		skip_install_trust
+		admin localhost:2999
+		http_port 9080
+		https_port 9443
+		grace_period 1ns
+		servers :9080 {
+			listener_wrappers {
+				proxy_protocol {
+					allow 127.0.0.0/8
+					policy {
+						versions 2
+						missing reject
+						tlv {
+							default reject
+							accept ALPN
+						}
+					}
+				}
+			}
+		}
+	}
+	http://localhost:9080 {
+		respond "{http.request.remote.host}"
+	}`, "caddyfile")
+
+	src := &net.TCPAddr{IP: net.ParseIP("10.0.0.7"), Port: 5555}
+	dst := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9080}
+	httpReq := "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		conn, err := net.Dial("tcp", "127.0.0.1:9080")
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		return conn
+	}
+
+	// readAll reads whatever the server sends before closing the connection,
+	// bounded by a deadline so rejected connections cannot hang the test.
+	readAll := func(t *testing.T, conn net.Conn) string {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var sb strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buf)
+			sb.Write(buf[:n])
+			if err != nil {
+				break
+			}
+		}
+		return sb.String()
+	}
+
+	// Accepted: v2 header with only the whitelisted ALPN TLV.
+	conn := dial(t)
+	hdr := goproxy.HeaderProxyFromAddrs(2, src, dst)
+	if err := hdr.SetTLVs([]goproxy.TLV{
+		{Type: goproxy.PP2_TYPE_ALPN, Value: []byte("h2")},
+	}); err != nil {
+		t.Fatalf("set tlvs: %v", err)
+	}
+	if _, err := hdr.WriteTo(conn); err != nil {
+		t.Fatalf("write proxy header: %v", err)
+	}
+	if _, err := fmt.Fprint(conn, httpReq); err != nil {
+		t.Fatalf("write http: %v", err)
+	}
+	if raw := readAll(t, conn); !strings.Contains(raw, "10.0.0.7") {
+		t.Errorf("accepted v2 header: expected spoofed address 10.0.0.7; got:\n%s", raw)
+	}
+
+	// Rejected: v1 header when only v2 is allowed.
+	conn = dial(t)
+	v1 := goproxy.HeaderProxyFromAddrs(1, src, dst)
+	if _, err := v1.WriteTo(conn); err != nil {
+		t.Fatalf("write v1 header: %v", err)
+	}
+	if _, err := fmt.Fprint(conn, httpReq); err != nil {
+		t.Fatalf("write http: %v", err)
+	}
+	if raw := readAll(t, conn); strings.Contains(raw, "HTTP/1.1") {
+		t.Errorf("v1 header must be rejected; got an HTTP response:\n%s", raw)
+	}
+
+	// Rejected: no header at all.
+	conn = dial(t)
+	if _, err := fmt.Fprint(conn, httpReq); err != nil {
+		t.Fatalf("write http: %v", err)
+	}
+	if raw := readAll(t, conn); strings.Contains(raw, "HTTP/1.1") {
+		t.Errorf("headerless connection must be rejected; got an HTTP response:\n%s", raw)
+	}
+
+	// Rejected: v2 header carrying a TLV type not on the accept list.
+	conn = dial(t)
+	hdrBad := goproxy.HeaderProxyFromAddrs(2, src, dst)
+	if err := hdrBad.SetTLVs([]goproxy.TLV{
+		{Type: goproxy.PP2_TYPE_SSL, Value: []byte{0, 0, 0, 0, 0}},
+	}); err != nil {
+		t.Fatalf("set tlvs: %v", err)
+	}
+	if _, err := hdrBad.WriteTo(conn); err != nil {
+		t.Fatalf("write proxy header: %v", err)
+	}
+	if _, err := fmt.Fprint(conn, httpReq); err != nil {
+		t.Fatalf("write http: %v", err)
+	}
+	if raw := readAll(t, conn); strings.Contains(raw, "HTTP/1.1") {
+		t.Errorf("header with a disallowed TLV must be rejected; got an HTTP response:\n%s", raw)
 	}
 }
